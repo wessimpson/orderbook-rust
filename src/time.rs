@@ -36,7 +36,6 @@ pub fn elapsed_ns(start: u128, end: u128) -> u128 {
 /// Format nanosecond timestamp as human-readable string
 pub fn format_ns(ns: u128) -> String {
     let secs = ns_to_secs(ns);
-    let dt = UNIX_EPOCH + std::time::Duration::from_nanos(ns as u64);
     format!("{:.9}", secs)
 }
 
