@@ -7,6 +7,7 @@ pub mod queue_fifo;
 pub mod engine;
 pub mod data;
 pub mod sim;
+pub mod server;
 
 // Re-export core types for convenience
 pub use types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
@@ -35,3 +36,6 @@ pub use data::{DataSource, MarketEvent, MarketStatusType, DataError, DataResult,
 
 // Re-export simulation types and traits
 pub use sim::{Simulator, NetModel, SimulationMode, MarketMakerConfig, OrderGenerationConfig};
+
+// Re-export server types and functions
+pub use server::{AppState, start_server, create_router, start_simulation_loop};

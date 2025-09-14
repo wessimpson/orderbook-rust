@@ -1,12 +1,32 @@
-use orderbook::{Order, Side, price_utils};
+use orderbook::{start_server, Simulator, OrderBook, FifoLevel};
+use std::env;
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    let port = if args.len() > 1 {
+        args[1].parse().unwrap_or(3000)
+    } else {
+        3000
+    };
+    
+    let simulation_interval_ms = if args.len() > 2 {
+        args[2].parse().unwrap_or(100)
+    } else {
+        100 // Default to 100ms intervals
+    };
+    
     println!("Order Book Server Starting...");
+    println!("Port: {}", port);
+    println!("Simulation interval: {}ms", simulation_interval_ms);
     
-    // Example usage of the core types
-    let order = Order::new_limit(1, Side::Buy, 100, price_utils::from_f64(50.25), 1000);
-    println!("Created order: {:?}", order);
-    println!("Order price: ${}", price_utils::format(order.price().unwrap()));
+    // Create order book engine and simulator
+    let engine = OrderBook::<FifoLevel>::new();
+    let simulator = Simulator::new(engine);
     
-    println!("Server initialized with core types");
+    // Start the WebSocket server
+    start_server(simulator, port, simulation_interval_ms).await?;
+    
+    Ok(())
 }

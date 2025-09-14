@@ -307,7 +307,7 @@ impl MarketEvent {
 }
 
 /// Trait for pluggable data sources that can feed market events into the system
-pub trait DataSource {
+pub trait DataSource: Send + Sync {
     /// Get the next market event from the data source
     /// Returns None when the end of data is reached
     fn next_event(&mut self) -> DataResult<Option<MarketEvent>>;
