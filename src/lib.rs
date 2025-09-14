@@ -4,6 +4,7 @@ pub mod error;
 pub mod logging;
 pub mod queue;
 pub mod queue_fifo;
+pub mod engine;
 
 // Re-export core types for convenience
 pub use types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
@@ -23,3 +24,6 @@ pub use logging::{init_logging, init_test_logging, log_engine_error, log_order_o
 // Re-export queue discipline trait and implementations
 pub use queue::QueueDiscipline;
 pub use queue_fifo::FifoLevel;
+
+// Re-export engine types and traits
+pub use engine::{OrderBookEngine, OrderBook, DepthSnapshot, BookLevelPoint};
