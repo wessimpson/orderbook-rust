@@ -5,6 +5,7 @@ pub mod logging;
 pub mod queue;
 pub mod queue_fifo;
 pub mod engine;
+pub mod data;
 
 // Re-export core types for convenience
 pub use types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
@@ -27,3 +28,6 @@ pub use queue_fifo::FifoLevel;
 
 // Re-export engine types and traits
 pub use engine::{OrderBookEngine, OrderBook, DepthSnapshot, BookLevelPoint};
+
+// Re-export data ingestion types and traits
+pub use data::{DataSource, MarketEvent, MarketStatusType, DataError, DataResult, DataSourceMetadata};

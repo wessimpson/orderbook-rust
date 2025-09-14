@@ -95,6 +95,61 @@ impl Side {
     }
 }
 
+/// Trading performance metrics
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metrics {
+    /// Current inventory position (positive = long, negative = short)
+    pub inventory: i64,
+    /// Current cash position in ticks
+    pub cash: i64,
+    /// Mark-to-market PnL in ticks
+    pub pnl: i64,
+}
+
+impl Metrics {
+    /// Create new metrics with zero values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update metrics after a trade execution
+    pub fn update_trade(&mut self, side: Side, qty: Qty, price: Price) {
+        match side {
+            Side::Buy => {
+                // Buying increases inventory, decreases cash
+                self.inventory += qty as i64;
+                self.cash -= (qty * price) as i64;
+            }
+            Side::Sell => {
+                // Selling decreases inventory, increases cash
+                self.inventory -= qty as i64;
+                self.cash += (qty * price) as i64;
+            }
+        }
+    }
+
+    /// Calculate mark-to-market PnL using current mid-price
+    pub fn calculate_pnl(&mut self, mid_price_ticks: Option<Price>) {
+        if let Some(mid_price) = mid_price_ticks {
+            // PnL = cash + (inventory * current_price)
+            self.pnl = self.cash + (self.inventory * mid_price as i64);
+        } else {
+            // No market price available, PnL is just cash position
+            self.pnl = self.cash;
+        }
+    }
+
+    /// Get PnL as floating point value in currency units
+    pub fn pnl_f64(&self) -> f64 {
+        self.pnl as f64 / 10000.0
+    }
+
+    /// Get cash as floating point value in currency units
+    pub fn cash_f64(&self) -> f64 {
+        self.cash as f64 / 10000.0
+    }
+}
+
 /// Price utility functions
 pub mod price_utils {
     use super::Price;
@@ -187,5 +242,74 @@ mod tests {
         let json = serde_json::to_string(&trade).unwrap();
         let deserialized: Trade = serde_json::from_str(&json).unwrap();
         assert_eq!(trade, deserialized);
+    }
+
+    #[test]
+    fn test_metrics_creation() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.inventory, 0);
+        assert_eq!(metrics.cash, 0);
+        assert_eq!(metrics.pnl, 0);
+
+        let default_metrics = Metrics::default();
+        assert_eq!(default_metrics, metrics);
+    }
+
+    #[test]
+    fn test_metrics_trade_updates() {
+        let mut metrics = Metrics::new();
+        
+        // Test buy trade
+        metrics.update_trade(Side::Buy, 100, from_f64(50.00)); // Buy 100 at $50.00
+        assert_eq!(metrics.inventory, 100);
+        assert_eq!(metrics.cash, -50000000); // -100 * 500000 ticks
+        
+        // Test sell trade
+        metrics.update_trade(Side::Sell, 50, from_f64(51.00)); // Sell 50 at $51.00
+        assert_eq!(metrics.inventory, 50); // 100 - 50
+        assert_eq!(metrics.cash, -24500000); // -50000000 + (50 * 510000)
+    }
+
+    #[test]
+    fn test_metrics_pnl_calculation() {
+        let mut metrics = Metrics::new();
+        
+        // Buy 100 shares at $50.00
+        metrics.update_trade(Side::Buy, 100, from_f64(50.00));
+        
+        // Calculate PnL at $51.00 mid-price
+        metrics.calculate_pnl(Some(from_f64(51.00)));
+        
+        // PnL = cash + (inventory * current_price)
+        // PnL = -50000000 + (100 * 510000) = 1000000 ticks = $100
+        assert_eq!(metrics.pnl, 1000000);
+        assert_eq!(metrics.pnl_f64(), 100.0);
+        
+        // Test with no market price
+        metrics.calculate_pnl(None);
+        assert_eq!(metrics.pnl, metrics.cash); // Should equal cash when no price
+    }
+
+    #[test]
+    fn test_metrics_floating_point_conversions() {
+        let mut metrics = Metrics::new();
+        metrics.cash = 1234567; // $123.4567
+        metrics.pnl = -987654; // -$98.7654
+        
+        assert_eq!(metrics.cash_f64(), 123.4567);
+        assert_eq!(metrics.pnl_f64(), -98.7654);
+    }
+
+    #[test]
+    fn test_metrics_serialization() {
+        let metrics = Metrics {
+            inventory: 100,
+            cash: -5000000,
+            pnl: 1000000,
+        };
+        
+        let json = serde_json::to_string(&metrics).unwrap();
+        let deserialized: Metrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(metrics, deserialized);
     }
 }

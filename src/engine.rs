@@ -24,6 +24,8 @@ pub struct DepthSnapshot {
     pub mid: Option<f64>,
     pub bids: Vec<BookLevelPoint>,
     pub asks: Vec<BookLevelPoint>,
+    pub recent_spreads: Vec<(u128, i64)>,
+    pub metrics: crate::types::Metrics,
 }
 
 /// Trait defining the core order book engine interface
@@ -130,6 +132,13 @@ pub struct OrderBook<D: QueueDiscipline> {
     
     /// Function to create new queue discipline instances
     level_factory: fn() -> D,
+    
+    /// Rolling history of spread values for visualization
+    /// Tuple format: (timestamp, spread_in_ticks)
+    recent_spreads: Vec<(u128, i64)>,
+    
+    /// Trading performance metrics
+    metrics: crate::types::Metrics,
 }
 
 impl<D: QueueDiscipline + Default> OrderBook<D> {
@@ -150,6 +159,8 @@ impl<D: QueueDiscipline> OrderBook<D> {
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
             level_factory,
+            recent_spreads: Vec::new(),
+            metrics: crate::types::Metrics::new(),
         }
     }
 
@@ -261,6 +272,15 @@ impl<D: QueueDiscipline> OrderBook<D> {
             }
         }
 
+        // Update metrics for each trade and spread history if trades occurred
+        if !trades.is_empty() {
+            for trade in &trades {
+                self.update_metrics_for_trade(trade, order.side);
+            }
+            // Update spread history after processing trades
+            self.update_spread_history();
+        }
+
         // Add remaining quantity to our side if any
         if order.qty > 0 {
             self.add_to_book(order, limit_price)?;
@@ -351,6 +371,15 @@ impl<D: QueueDiscipline> OrderBook<D> {
             }
         }
 
+        // Update metrics for each trade and spread history if trades occurred
+        if !trades.is_empty() {
+            for trade in &trades {
+                self.update_metrics_for_trade(trade, order.side);
+            }
+            // Update spread history after processing trades
+            self.update_spread_history();
+        }
+
         // Market orders don't rest in the book - any unfilled quantity is lost
         if order.qty > 0 {
             return Err(EngineError::reject(format!(
@@ -386,6 +415,44 @@ impl<D: QueueDiscipline> OrderBook<D> {
         let current_ts = now_ns();
         let latency_ns = current_ts.saturating_sub(last_activity_ts);
         (latency_ns / 1_000_000).min(u64::MAX as u128) as u64
+    }
+
+    /// Update spread history with current spread
+    fn update_spread_history(&mut self) {
+        if let Some(spread) = self.spread() {
+            let ts = now_ns();
+            self.recent_spreads.push((ts, spread));
+            
+            // Keep only last 400 data points for performance
+            if self.recent_spreads.len() > 400 {
+                self.recent_spreads.remove(0);
+            }
+        }
+    }
+
+    /// Update metrics after trade execution
+    fn update_metrics_for_trade(&mut self, trade: &Trade, taker_side: Side) {
+        // Update metrics based on the taker's perspective
+        self.metrics.update_trade(taker_side, trade.qty, trade.price);
+        
+        // Calculate PnL using current mid-price
+        let mid_price_ticks = self.mid_price().map(|mid| (mid * 10000.0) as Price);
+        self.metrics.calculate_pnl(mid_price_ticks);
+    }
+
+    /// Get a copy of recent spreads for snapshot
+    fn get_recent_spreads(&self) -> Vec<(u128, i64)> {
+        self.recent_spreads.clone()
+    }
+
+    /// Get current metrics
+    pub fn get_metrics(&self) -> &crate::types::Metrics {
+        &self.metrics
+    }
+
+    /// Reset metrics to zero (useful for testing or restarting simulation)
+    pub fn reset_metrics(&mut self) {
+        self.metrics = crate::types::Metrics::new();
     }
 }
 
@@ -501,6 +568,8 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
             mid,
             bids,
             asks,
+            recent_spreads: self.get_recent_spreads(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -710,6 +779,173 @@ mod tests {
         assert_eq!(snapshot.asks[0].qty, 150);
         assert_eq!(snapshot.asks[1].price, 520000);
         assert_eq!(snapshot.asks[1].qty, 300);
+        
+        // Check that snapshot includes new fields
+        assert!(snapshot.recent_spreads.is_empty()); // No trades yet, so no spread history
+        assert_eq!(snapshot.metrics.inventory, 0);
+        assert_eq!(snapshot.metrics.cash, 0);
+        assert_eq!(snapshot.metrics.pnl, 0);
+        
+        // Check latency information is included (latency_ms is u64, so always >= 0)
+        // Just verify the field exists and is a reasonable value
+        assert!(snapshot.bids[0].latency_ms < 1000000); // Less than 1000 seconds
+        assert!(snapshot.asks[0].latency_ms < 1000000);
+    }
+
+    #[test]
+    fn test_spread_history_tracking() {
+        let mut book = TestOrderBook::new();
+        
+        // Place initial orders to establish spread
+        let buy1 = create_test_order(1, Side::Buy, 100, OrderType::Limit { price: 500000 });
+        let sell1 = create_test_order(2, Side::Sell, 100, OrderType::Limit { price: 510000 });
+        
+        book.place(buy1).unwrap();
+        book.place(sell1).unwrap();
+        
+        // Execute a trade to trigger spread history update
+        let market_buy = create_test_order(3, Side::Buy, 50, OrderType::Market);
+        book.place(market_buy).unwrap();
+        
+        let snapshot = book.snapshot();
+        
+        // Should have at least one spread entry after the trade
+        assert!(!snapshot.recent_spreads.is_empty());
+        
+        // The spread should be recorded
+        let (ts, spread) = snapshot.recent_spreads[0];
+        assert!(ts > 0);
+        assert_eq!(spread, 10000); // $1.00 spread in ticks
+    }
+
+    #[test]
+    fn test_metrics_tracking() {
+        let mut book = TestOrderBook::new();
+        
+        // Place orders
+        let sell1 = create_test_order(1, Side::Sell, 100, OrderType::Limit { price: 500000 });
+        let buy1 = create_test_order(2, Side::Buy, 200, OrderType::Limit { price: 495000 });
+        
+        book.place(sell1).unwrap();
+        book.place(buy1).unwrap();
+        
+        // Execute a market buy that will trade against the sell order
+        let market_buy = create_test_order(3, Side::Buy, 50, OrderType::Market);
+        let trades = book.place(market_buy).unwrap();
+        
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].qty, 50);
+        assert_eq!(trades[0].price, 500000);
+        
+        let snapshot = book.snapshot();
+        
+        // Check that metrics were updated for the buy trade
+        assert_eq!(snapshot.metrics.inventory, 50); // Bought 50 shares
+        assert_eq!(snapshot.metrics.cash, -25000000); // Paid 50 * 500000 ticks
+        
+        // PnL should be calculated (inventory * mid_price + cash)
+        // Mid price should be around 497500 (between 495000 and 500000)
+        assert!(snapshot.metrics.pnl != 0);
+    }
+
+    #[test]
+    fn test_metrics_multiple_trades() {
+        let mut book = TestOrderBook::new();
+        
+        // Place orders on both sides
+        let sell1 = create_test_order(1, Side::Sell, 100, OrderType::Limit { price: 500000 });
+        let sell2 = create_test_order(2, Side::Sell, 100, OrderType::Limit { price: 510000 });
+        let buy1 = create_test_order(3, Side::Buy, 100, OrderType::Limit { price: 490000 });
+        
+        book.place(sell1).unwrap();
+        book.place(sell2).unwrap();
+        book.place(buy1).unwrap();
+        
+        // Execute multiple trades
+        let market_buy1 = create_test_order(4, Side::Buy, 50, OrderType::Market);
+        let market_buy2 = create_test_order(5, Side::Buy, 30, OrderType::Market);
+        let market_sell1 = create_test_order(6, Side::Sell, 40, OrderType::Market);
+        
+        book.place(market_buy1).unwrap(); // Buy 50 at 500000
+        book.place(market_buy2).unwrap(); // Buy 30 at 500000
+        book.place(market_sell1).unwrap(); // Sell 40 at 490000
+        
+        let snapshot = book.snapshot();
+        
+        // Net inventory: +50 +30 -40 = +40
+        assert_eq!(snapshot.metrics.inventory, 40);
+        
+        // Net cash: -(50*500000) -(30*500000) +(40*490000)
+        let expected_cash = -(50 * 500000) - (30 * 500000) + (40 * 490000);
+        assert_eq!(snapshot.metrics.cash, expected_cash);
+    }
+
+    #[test]
+    fn test_latency_calculation() {
+        let mut book = TestOrderBook::new();
+        
+        // Place an order and immediately take snapshot
+        let order = create_test_order(1, Side::Buy, 100, OrderType::Limit { price: 500000 });
+        book.place(order).unwrap();
+        
+        let snapshot1 = book.snapshot();
+        assert_eq!(snapshot1.bids.len(), 1);
+        let initial_latency = snapshot1.bids[0].latency_ms;
+        
+        // Wait a bit and take another snapshot
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        
+        let snapshot2 = book.snapshot();
+        let later_latency = snapshot2.bids[0].latency_ms;
+        
+        // Latency should have increased
+        assert!(later_latency >= initial_latency);
+    }
+
+    #[test]
+    fn test_spread_history_bounded() {
+        let mut book = TestOrderBook::new();
+        
+        // Place orders to establish spread
+        let sell1 = create_test_order(1, Side::Sell, 1000, OrderType::Limit { price: 500000 });
+        book.place(sell1).unwrap();
+        
+        // Execute many trades to test history bounding
+        for i in 0..450 {
+            let market_buy = create_test_order(100 + i, Side::Buy, 1, OrderType::Market);
+            book.place(market_buy).unwrap();
+        }
+        
+        let snapshot = book.snapshot();
+        
+        // Should be bounded to 400 entries
+        assert!(snapshot.recent_spreads.len() <= 400);
+    }
+
+    #[test]
+    fn test_metrics_reset() {
+        let mut book = TestOrderBook::new();
+        
+        // Execute some trades
+        let sell1 = create_test_order(1, Side::Sell, 100, OrderType::Limit { price: 500000 });
+        book.place(sell1).unwrap();
+        
+        let market_buy = create_test_order(2, Side::Buy, 50, OrderType::Market);
+        book.place(market_buy).unwrap();
+        
+        // Verify metrics are non-zero
+        let metrics_before = book.get_metrics();
+        assert_ne!(metrics_before.inventory, 0);
+        assert_ne!(metrics_before.cash, 0);
+        
+        // Reset metrics
+        book.reset_metrics();
+        
+        // Verify metrics are reset
+        let metrics_after = book.get_metrics();
+        assert_eq!(metrics_after.inventory, 0);
+        assert_eq!(metrics_after.cash, 0);
+        assert_eq!(metrics_after.pnl, 0);
     }
 
     #[test]
