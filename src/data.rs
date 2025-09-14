@@ -4,6 +4,7 @@ use thiserror::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::io::BufRead;
 use csv::{Reader, StringRecord};
 
 /// Errors that can occur during data ingestion
@@ -1463,5 +1464,1105 @@ mod tests {
             assert_eq!(error_count, 0);
             assert!(csv_source.is_finished());
         }
+    }
+}
+
+/// JSON data source for structured market event data
+#[derive(Debug)]
+pub struct JsonDataSource {
+    /// Buffered reader for the JSON file
+    reader: std::io::BufReader<File>,
+    /// Path to the JSON file
+    file_path: PathBuf,
+    /// Current line number for error reporting
+    current_line: usize,
+    /// Playback speed multiplier (1.0 = real-time)
+    playback_speed: f64,
+    /// Whether playback is paused
+    paused: bool,
+    /// Last event timestamp for timing control
+    last_timestamp: Option<u128>,
+    /// Start time for playback timing
+    playback_start: Option<Instant>,
+    /// Current position in the data stream
+    current_position: Option<u128>,
+    /// Metadata about the data source
+    metadata: DataSourceMetadata,
+    /// Whether we've reached the end of the file
+    finished: bool,
+    /// Buffer for reading lines
+    line_buffer: String,
+}
+
+impl JsonDataSource {
+    /// Create a new JSON data source from a file path
+    pub fn new<P: AsRef<Path>>(file_path: P) -> DataResult<Self> {
+        let path = file_path.as_ref().to_path_buf();
+        let file = File::open(&path).map_err(|_| DataError::file_not_found(path.display().to_string()))?;
+        
+        let reader = std::io::BufReader::new(file);
+
+        // Get file metadata
+        let file_size = std::fs::metadata(&path)?.len();
+        let metadata = DataSourceMetadata::new(
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            "JSON"
+        ).with_file_size(file_size);
+
+        Ok(Self {
+            reader,
+            file_path: path,
+            current_line: 0,
+            playback_speed: 1.0,
+            paused: false,
+            last_timestamp: None,
+            playback_start: None,
+            current_position: None,
+            metadata,
+            finished: false,
+            line_buffer: String::new(),
+        })
+    }
+
+    /// Parse a JSON line into a MarketEvent
+    fn parse_json_line(&self, line: &str) -> DataResult<MarketEvent> {
+        let event: MarketEvent = serde_json::from_str(line.trim()).map_err(|e| {
+            DataError::parse_error(
+                &self.file_path.display().to_string(),
+                self.current_line,
+                format!("JSON parse error: {}", e)
+            )
+        })?;
+
+        // Validate the event
+        event.validate()?;
+        Ok(event)
+    }
+
+    /// Handle timing for playback speed control
+    fn handle_timing(&mut self, event_timestamp: u128) -> DataResult<()> {
+        if self.paused {
+            return Ok(());
+        }
+
+        if let Some(last_ts) = self.last_timestamp {
+            if event_timestamp > last_ts {
+                let time_diff_ns = event_timestamp - last_ts;
+                let real_time_diff = Duration::from_nanos(time_diff_ns as u64);
+                let adjusted_diff = real_time_diff.div_f64(self.playback_speed);
+
+                if let Some(start_time) = self.playback_start {
+                    let elapsed = start_time.elapsed();
+                    let target_elapsed = Duration::from_nanos((event_timestamp - self.last_timestamp.unwrap_or(0)) as u64);
+                    
+                    if elapsed < target_elapsed {
+                        std::thread::sleep(target_elapsed - elapsed);
+                    }
+                } else {
+                    std::thread::sleep(adjusted_diff);
+                }
+            }
+        } else {
+            // First event, record start time
+            self.playback_start = Some(Instant::now());
+        }
+
+        self.last_timestamp = Some(event_timestamp);
+        Ok(())
+    }
+}
+
+impl DataSource for JsonDataSource {
+    fn next_event(&mut self) -> DataResult<Option<MarketEvent>> {
+        use std::io::BufRead;
+
+        if self.finished {
+            return Ok(None);
+        }
+
+        self.line_buffer.clear();
+        
+        // Read next line
+        match self.reader.read_line(&mut self.line_buffer) {
+            Ok(0) => {
+                // End of file
+                self.finished = true;
+                return Ok(None);
+            }
+            Ok(_) => {
+                self.current_line += 1;
+                
+                // Skip empty lines
+                if self.line_buffer.trim().is_empty() {
+                    return self.next_event(); // Recursively try next line
+                }
+
+                // Parse the JSON line
+                let event = self.parse_json_line(&self.line_buffer)?;
+                
+                // Update current position
+                self.current_position = Some(event.timestamp());
+
+                // Handle timing for playback speed
+                self.handle_timing(event.timestamp())?;
+
+                Ok(Some(event))
+            }
+            Err(e) => Err(DataError::IoError {
+                message: format!("Failed to read line: {}", e),
+            }),
+        }
+    }
+
+    fn seek_to_time(&mut self, timestamp: u128) -> DataResult<()> {
+        // Reset to beginning and scan for the target timestamp
+        self.reset()?;
+        
+        loop {
+            self.line_buffer.clear();
+            
+            match self.reader.read_line(&mut self.line_buffer) {
+                Ok(0) => break, // End of file
+                Ok(_) => {
+                    self.current_line += 1;
+                    
+                    // Skip empty lines
+                    if self.line_buffer.trim().is_empty() {
+                        continue;
+                    }
+
+                    // Parse just to get the timestamp
+                    if let Ok(event) = self.parse_json_line(&self.line_buffer) {
+                        if event.timestamp() >= timestamp {
+                            // Found target - we can't seek back in a BufReader easily,
+                            // so we'll need to recreate the reader
+                            let file = File::open(&self.file_path)?;
+                            self.reader = std::io::BufReader::new(file);
+                            self.current_line = 0;
+                            
+                            // Read up to the target line again
+                            for _ in 0..(self.current_line - 1) {
+                                self.line_buffer.clear();
+                                self.reader.read_line(&mut self.line_buffer)?;
+                            }
+                            
+                            self.current_position = Some(event.timestamp());
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => return Err(DataError::IoError {
+                    message: format!("Failed to read during seek: {}", e),
+                }),
+            }
+        }
+
+        Err(DataError::seek_failed(format!("Timestamp {} not found in data", timestamp)))
+    }
+
+    fn set_playback_speed(&mut self, multiplier: f64) -> DataResult<()> {
+        if multiplier <= 0.0 {
+            return Err(DataError::validation("Playback speed must be positive"));
+        }
+        self.playback_speed = multiplier;
+        Ok(())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn current_position(&self) -> Option<u128> {
+        self.current_position
+    }
+
+    fn duration(&self) -> Option<(u128, u128)> {
+        // This would require scanning the entire file, which is expensive
+        // For now, return None - could be implemented as a separate method
+        None
+    }
+
+    fn reset(&mut self) -> DataResult<()> {
+        let file = File::open(&self.file_path)?;
+        self.reader = std::io::BufReader::new(file);
+        self.current_line = 0;
+        self.finished = false;
+        self.last_timestamp = None;
+        self.playback_start = None;
+        self.current_position = None;
+        Ok(())
+    }
+
+    fn metadata(&self) -> DataSourceMetadata {
+        self.metadata.clone()
+    }
+
+    fn set_paused(&mut self, paused: bool) -> DataResult<()> {
+        self.paused = paused;
+        Ok(())
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
+/// Binary data format specification and header
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BinaryDataHeader {
+    /// Magic number to identify the format
+    pub magic: u32,
+    /// Version of the binary format
+    pub version: u16,
+    /// Flags for format options
+    pub flags: u16,
+    /// Number of events in the file
+    pub event_count: u64,
+    /// Timestamp of first event
+    pub start_timestamp: u128,
+    /// Timestamp of last event
+    pub end_timestamp: u128,
+    /// Reserved bytes for future use
+    pub reserved: [u8; 32],
+}
+
+impl BinaryDataHeader {
+    /// Magic number for our binary format
+    pub const MAGIC: u32 = 0x4F424B42; // "OBKB" in ASCII
+
+    /// Current version of the binary format
+    pub const VERSION: u16 = 1;
+
+    /// Create a new header with default values
+    pub fn new() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            flags: 0,
+            event_count: 0,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            reserved: [0; 32],
+        }
+    }
+
+    /// Validate the header
+    pub fn validate(&self) -> DataResult<()> {
+        if self.magic != Self::MAGIC {
+            return Err(DataError::InvalidFormat {
+                file: "binary".to_string(),
+                details: format!("Invalid magic number: 0x{:08X}", self.magic),
+            });
+        }
+
+        if self.version > Self::VERSION {
+            return Err(DataError::InvalidFormat {
+                file: "binary".to_string(),
+                details: format!("Unsupported version: {}", self.version),
+            });
+        }
+
+        if self.start_timestamp > self.end_timestamp && self.event_count > 0 {
+            return Err(DataError::InvalidFormat {
+                file: "binary".to_string(),
+                details: "Start timestamp is after end timestamp".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Size of the header in bytes
+    pub const fn size() -> usize {
+        4 + 2 + 2 + 8 + 16 + 16 + 32 // magic + version + flags + event_count + start_ts + end_ts + reserved
+    }
+}
+
+impl Default for BinaryDataHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Binary data source for high-performance data replay
+#[derive(Debug)]
+pub struct BinaryDataSource {
+    /// File handle for the binary data
+    file: File,
+    /// Path to the binary file
+    file_path: PathBuf,
+    /// Header information
+    header: BinaryDataHeader,
+    /// Current event index
+    current_event: u64,
+    /// Playback speed multiplier (1.0 = real-time)
+    playback_speed: f64,
+    /// Whether playback is paused
+    paused: bool,
+    /// Last event timestamp for timing control
+    last_timestamp: Option<u128>,
+    /// Start time for playback timing
+    playback_start: Option<Instant>,
+    /// Current position in the data stream
+    current_position: Option<u128>,
+    /// Metadata about the data source
+    metadata: DataSourceMetadata,
+    /// Whether we've reached the end of the file
+    finished: bool,
+}
+
+impl BinaryDataSource {
+    /// Create a new binary data source from a file path
+    pub fn new<P: AsRef<Path>>(file_path: P) -> DataResult<Self> {
+        let path = file_path.as_ref().to_path_buf();
+        let mut file = File::open(&path).map_err(|_| DataError::file_not_found(path.display().to_string()))?;
+        
+        // Read and validate header
+        let header = Self::read_header(&mut file)?;
+        header.validate()?;
+
+        // Get file metadata
+        let file_size = std::fs::metadata(&path)?.len();
+        let metadata = DataSourceMetadata::new(
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            "Binary"
+        )
+        .with_file_size(file_size)
+        .with_event_count(header.event_count as usize)
+        .with_time_range(header.start_timestamp, header.end_timestamp);
+
+        let start_timestamp = header.start_timestamp;
+        
+        Ok(Self {
+            file,
+            file_path: path,
+            header,
+            current_event: 0,
+            playback_speed: 1.0,
+            paused: false,
+            last_timestamp: None,
+            playback_start: None,
+            current_position: Some(start_timestamp),
+            metadata,
+            finished: false,
+        })
+    }
+
+    /// Read the binary header from the file
+    fn read_header(file: &mut File) -> DataResult<BinaryDataHeader> {
+        use std::io::{Read, Seek, SeekFrom};
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        file.seek(SeekFrom::Start(0))?;
+
+        let magic = file.read_u32::<LittleEndian>()?;
+        let version = file.read_u16::<LittleEndian>()?;
+        let flags = file.read_u16::<LittleEndian>()?;
+        let event_count = file.read_u64::<LittleEndian>()?;
+        let start_timestamp = file.read_u128::<LittleEndian>()?;
+        let end_timestamp = file.read_u128::<LittleEndian>()?;
+        
+        let mut reserved = [0u8; 32];
+        file.read_exact(&mut reserved)?;
+
+        Ok(BinaryDataHeader {
+            magic,
+            version,
+            flags,
+            event_count,
+            start_timestamp,
+            end_timestamp,
+            reserved,
+        })
+    }
+
+    /// Read the next event from the binary file
+    fn read_next_event(&mut self) -> DataResult<Option<MarketEvent>> {
+        use std::io::Read;
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        if self.current_event >= self.header.event_count {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        // Read event length
+        let event_length = self.file.read_u32::<LittleEndian>()?;
+        
+        // Read event data
+        let mut event_data = vec![0u8; event_length as usize];
+        self.file.read_exact(&mut event_data)?;
+
+        // Deserialize the event using bincode
+        let event: MarketEvent = bincode::deserialize(&event_data).map_err(|e| {
+            DataError::InvalidFormat {
+                file: self.file_path.display().to_string(),
+                details: format!("Failed to deserialize event {}: {}", self.current_event, e),
+            }
+        })?;
+
+        // Validate the event
+        event.validate()?;
+
+        self.current_event += 1;
+        self.current_position = Some(event.timestamp());
+
+        Ok(Some(event))
+    }
+
+    /// Handle timing for playback speed control
+    fn handle_timing(&mut self, event_timestamp: u128) -> DataResult<()> {
+        if self.paused {
+            return Ok(());
+        }
+
+        if let Some(last_ts) = self.last_timestamp {
+            if event_timestamp > last_ts {
+                let time_diff_ns = event_timestamp - last_ts;
+                let real_time_diff = Duration::from_nanos(time_diff_ns as u64);
+                let adjusted_diff = real_time_diff.div_f64(self.playback_speed);
+
+                if let Some(start_time) = self.playback_start {
+                    let elapsed = start_time.elapsed();
+                    let target_elapsed = Duration::from_nanos((event_timestamp - self.last_timestamp.unwrap_or(0)) as u64);
+                    
+                    if elapsed < target_elapsed {
+                        std::thread::sleep(target_elapsed - elapsed);
+                    }
+                } else {
+                    std::thread::sleep(adjusted_diff);
+                }
+            }
+        } else {
+            // First event, record start time
+            self.playback_start = Some(Instant::now());
+        }
+
+        self.last_timestamp = Some(event_timestamp);
+        Ok(())
+    }
+
+    /// Write a binary data file from a collection of events
+    pub fn write_binary_file<P: AsRef<Path>>(
+        file_path: P,
+        events: &[MarketEvent],
+    ) -> DataResult<()> {
+        use std::io::Write;
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let path = file_path.as_ref();
+        let mut file = File::create(path)?;
+
+        // Calculate header information
+        let start_timestamp = events.first().map(|e| e.timestamp()).unwrap_or(0);
+        let end_timestamp = events.last().map(|e| e.timestamp()).unwrap_or(0);
+
+        let mut header = BinaryDataHeader::new();
+        header.event_count = events.len() as u64;
+        header.start_timestamp = start_timestamp;
+        header.end_timestamp = end_timestamp;
+
+        // Write header
+        Self::write_header(&mut file, &header)?;
+
+        // Write events
+        for event in events {
+            // Serialize event using bincode
+            let event_data = bincode::serialize(event).map_err(|e| {
+                DataError::InvalidFormat {
+                    file: path.display().to_string(),
+                    details: format!("Failed to serialize event: {}", e),
+                }
+            })?;
+
+            // Write event length and data
+            file.write_u32::<LittleEndian>(event_data.len() as u32)?;
+            file.write_all(&event_data)?;
+        }
+
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Write the binary header to a file
+    fn write_header(file: &mut File, header: &BinaryDataHeader) -> DataResult<()> {
+        use std::io::Write;
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        file.write_u32::<LittleEndian>(header.magic)?;
+        file.write_u16::<LittleEndian>(header.version)?;
+        file.write_u16::<LittleEndian>(header.flags)?;
+        file.write_u64::<LittleEndian>(header.event_count)?;
+        file.write_u128::<LittleEndian>(header.start_timestamp)?;
+        file.write_u128::<LittleEndian>(header.end_timestamp)?;
+        file.write_all(&header.reserved)?;
+
+        Ok(())
+    }
+}
+
+impl DataSource for BinaryDataSource {
+    fn next_event(&mut self) -> DataResult<Option<MarketEvent>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let event = self.read_next_event()?;
+        
+        if let Some(ref event) = event {
+            // Handle timing for playback speed
+            self.handle_timing(event.timestamp())?;
+        }
+
+        Ok(event)
+    }
+
+    fn seek_to_time(&mut self, timestamp: u128) -> DataResult<()> {
+        use std::io::{Seek, SeekFrom};
+
+        // Reset to beginning of events (after header)
+        self.file.seek(SeekFrom::Start(BinaryDataHeader::size() as u64))?;
+        self.current_event = 0;
+        self.finished = false;
+
+        // Scan for the target timestamp
+        let mut target_event_index = None;
+        
+        while self.current_event < self.header.event_count {
+            let event_index = self.current_event; // Save before reading
+            let event = self.read_next_event()?;
+            
+            if let Some(event) = event {
+                if event.timestamp() >= timestamp {
+                    target_event_index = Some(event_index);
+                    break;
+                }
+            }
+        }
+
+        if let Some(target_index) = target_event_index {
+            // Reset and skip to the target event
+            self.reset()?;
+            
+            // Skip events until we reach the target
+            for _ in 0..target_index {
+                self.read_next_event()?;
+            }
+            
+            return Ok(());
+        }
+
+        Err(DataError::seek_failed(format!("Timestamp {} not found in data", timestamp)))
+    }
+
+    fn set_playback_speed(&mut self, multiplier: f64) -> DataResult<()> {
+        if multiplier <= 0.0 {
+            return Err(DataError::validation("Playback speed must be positive"));
+        }
+        self.playback_speed = multiplier;
+        Ok(())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn current_position(&self) -> Option<u128> {
+        self.current_position
+    }
+
+    fn duration(&self) -> Option<(u128, u128)> {
+        Some((self.header.start_timestamp, self.header.end_timestamp))
+    }
+
+    fn reset(&mut self) -> DataResult<()> {
+        use std::io::{Seek, SeekFrom};
+
+        self.file.seek(SeekFrom::Start(BinaryDataHeader::size() as u64))?;
+        self.current_event = 0;
+        self.finished = false;
+        self.last_timestamp = None;
+        self.playback_start = None;
+        self.current_position = Some(self.header.start_timestamp);
+        Ok(())
+    }
+
+    fn metadata(&self) -> DataSourceMetadata {
+        self.metadata.clone()
+    }
+
+    fn set_paused(&mut self, paused: bool) -> DataResult<()> {
+        self.paused = paused;
+        Ok(())
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
+/// Data format detection utilities
+pub struct DataFormatDetector;
+
+impl DataFormatDetector {
+    /// Detect the format of a data file based on its content and extension
+    pub fn detect_format<P: AsRef<Path>>(file_path: P) -> DataResult<DataFormat> {
+        let path = file_path.as_ref();
+        
+        // First try by file extension
+        if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+            match extension.to_lowercase().as_str() {
+                "csv" => return Ok(DataFormat::Csv),
+                "json" | "jsonl" | "ndjson" => return Ok(DataFormat::Json),
+                "bin" | "binary" | "obk" => return Ok(DataFormat::Binary),
+                _ => {} // Continue with content detection
+            }
+        }
+
+        // Try content-based detection
+        Self::detect_by_content(path)
+    }
+
+    /// Detect format by examining file content
+    fn detect_by_content<P: AsRef<Path>>(file_path: P) -> DataResult<DataFormat> {
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+        let mut file = File::open(&file_path)?;
+        
+        // Try binary format first (check magic number)
+        let mut magic_bytes = [0u8; 4];
+        if file.read_exact(&mut magic_bytes).is_ok() {
+            let magic = u32::from_le_bytes(magic_bytes);
+            if magic == BinaryDataHeader::MAGIC {
+                return Ok(DataFormat::Binary);
+            }
+        }
+
+        // Reset file position
+        file.seek(SeekFrom::Start(0))?;
+        
+        // Try text-based formats
+        let mut reader = BufReader::new(file);
+        let mut first_line = String::new();
+        
+        if reader.read_line(&mut first_line).is_ok() && !first_line.is_empty() {
+            let trimmed = first_line.trim();
+            
+            // Check for JSON (starts with { or [)
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                return Ok(DataFormat::Json);
+            }
+            
+            // Check for CSV (contains commas and looks like CSV header)
+            if trimmed.contains(',') {
+                // Simple heuristic: if it contains common CSV headers
+                let lower = trimmed.to_lowercase();
+                if lower.contains("timestamp") || lower.contains("price") || lower.contains("qty") {
+                    return Ok(DataFormat::Csv);
+                }
+            }
+        }
+
+        // Default to CSV if we can't determine
+        Ok(DataFormat::Csv)
+    }
+
+    /// Create a data source based on the detected format
+    pub fn create_data_source<P: AsRef<Path>>(file_path: P) -> DataResult<Box<dyn DataSource>> {
+        let path = file_path.as_ref();
+        let format = Self::detect_format(path)?;
+        
+        match format {
+            DataFormat::Csv => Ok(Box::new(CsvDataSource::new(path)?)),
+            DataFormat::Json => Ok(Box::new(JsonDataSource::new(path)?)),
+            DataFormat::Binary => Ok(Box::new(BinaryDataSource::new(path)?)),
+        }
+    }
+}
+
+/// Supported data formats
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFormat {
+    /// Comma-separated values format
+    Csv,
+    /// JSON Lines format (one JSON object per line)
+    Json,
+    /// Custom binary format
+    Binary,
+}
+
+impl DataFormat {
+    /// Get the typical file extensions for this format
+    pub fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            Self::Csv => &["csv", "tsv"],
+            Self::Json => &["json", "jsonl", "ndjson"],
+            Self::Binary => &["bin", "binary", "obk"],
+        }
+    }
+
+    /// Get a human-readable description of the format
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Csv => "Comma-Separated Values",
+            Self::Json => "JSON Lines",
+            Self::Binary => "Binary Order Book Format",
+        }
+    }
+}
+
+impl std::fmt::Display for DataFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.description())
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_json_data_source_creation() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let json_source = JsonDataSource::new(temp_file.path()).unwrap();
+        assert_eq!(json_source.metadata().source_type, "JSON");
+        assert!(!json_source.is_finished());
+    }
+
+    #[test]
+    fn test_json_event_parsing() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        writeln!(temp_file, r#"{{"Quote": {{"bid": 10020, "ask": 10030, "bid_qty": 100, "ask_qty": 200, "timestamp": 1000000001}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut json_source = JsonDataSource::new(temp_file.path()).unwrap();
+        
+        // First event should be a trade
+        let event1 = json_source.next_event().unwrap().unwrap();
+        match event1 {
+            MarketEvent::Trade { price, qty, side, timestamp, .. } => {
+                assert_eq!(price, 10025);
+                assert_eq!(qty, 500);
+                assert_eq!(side, Side::Buy);
+                assert_eq!(timestamp, 1000000000);
+            }
+            _ => panic!("Expected Trade event"),
+        }
+
+        // Second event should be a quote
+        let event2 = json_source.next_event().unwrap().unwrap();
+        match event2 {
+            MarketEvent::Quote { bid, ask, bid_qty, ask_qty, timestamp } => {
+                assert_eq!(bid, Some(10020));
+                assert_eq!(ask, Some(10030));
+                assert_eq!(bid_qty, Some(100));
+                assert_eq!(ask_qty, Some(200));
+                assert_eq!(timestamp, 1000000001);
+            }
+            _ => panic!("Expected Quote event"),
+        }
+
+        // Should be at end
+        assert!(json_source.next_event().unwrap().is_none());
+        assert!(json_source.is_finished());
+    }
+
+    #[test]
+    fn test_json_playback_speed() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut json_source = JsonDataSource::new(temp_file.path()).unwrap();
+        
+        // Test setting playback speed
+        json_source.set_playback_speed(2.0).unwrap();
+        assert_eq!(json_source.playback_speed, 2.0);
+
+        // Test invalid playback speed
+        assert!(json_source.set_playback_speed(0.0).is_err());
+        assert!(json_source.set_playback_speed(-1.0).is_err());
+    }
+
+    #[test]
+    fn test_json_pause_resume() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut json_source = JsonDataSource::new(temp_file.path()).unwrap();
+        
+        assert!(!json_source.is_paused());
+        json_source.set_paused(true).unwrap();
+        assert!(json_source.is_paused());
+        json_source.set_paused(false).unwrap();
+        assert!(!json_source.is_paused());
+    }
+
+    #[test]
+    fn test_json_reset() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut json_source = JsonDataSource::new(temp_file.path()).unwrap();
+        
+        // Read an event
+        let _event = json_source.next_event().unwrap().unwrap();
+        assert!(json_source.current_position().is_some());
+
+        // Reset
+        json_source.reset().unwrap();
+        assert!(!json_source.is_finished());
+        assert_eq!(json_source.current_line, 0);
+
+        // Should be able to read the event again
+        let event = json_source.next_event().unwrap().unwrap();
+        match event {
+            MarketEvent::Trade { price, .. } => assert_eq!(price, 10025),
+            _ => panic!("Expected Trade event"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use crate::types::{Order, Side};
+
+    #[test]
+    fn test_binary_header() {
+        let header = BinaryDataHeader::new();
+        assert_eq!(header.magic, BinaryDataHeader::MAGIC);
+        assert_eq!(header.version, BinaryDataHeader::VERSION);
+        
+        // Test validation
+        header.validate().unwrap();
+
+        // Test invalid magic
+        let mut bad_header = header.clone();
+        bad_header.magic = 0x12345678;
+        assert!(bad_header.validate().is_err());
+
+        // Test invalid version
+        let mut bad_header = header.clone();
+        bad_header.version = 999;
+        assert!(bad_header.validate().is_err());
+    }
+
+    #[test]
+    fn test_binary_write_and_read() {
+        let temp_file = NamedTempFile::new().unwrap();
+        
+        // Create test events
+        let events = vec![
+            MarketEvent::Trade {
+                price: 10025,
+                qty: 500,
+                side: Side::Buy,
+                timestamp: 1000000000,
+                trade_id: Some("T1".to_string()),
+            },
+            MarketEvent::Quote {
+                bid: Some(10020),
+                ask: Some(10030),
+                bid_qty: Some(100),
+                ask_qty: Some(200),
+                timestamp: 1000000001,
+            },
+            MarketEvent::OrderPlacement(Order::new_limit(1, Side::Buy, 100, 10020, 1000000002)),
+        ];
+
+        // Write binary file
+        BinaryDataSource::write_binary_file(temp_file.path(), &events).unwrap();
+
+        // Read it back
+        let mut binary_source = BinaryDataSource::new(temp_file.path()).unwrap();
+        
+        // Check metadata
+        let metadata = binary_source.metadata();
+        assert_eq!(metadata.source_type, "Binary");
+        assert_eq!(metadata.event_count, Some(3));
+        assert_eq!(metadata.time_range, Some((1000000000, 1000000002)));
+
+        // Read events back
+        let mut read_events = Vec::new();
+        while let Some(event) = binary_source.next_event().unwrap() {
+            read_events.push(event);
+        }
+
+        assert_eq!(read_events.len(), 3);
+        assert_eq!(read_events, events);
+        assert!(binary_source.is_finished());
+    }
+
+    #[test]
+    fn test_binary_seek() {
+        let temp_file = NamedTempFile::new().unwrap();
+        
+        // Create test events with different timestamps
+        let events = vec![
+            MarketEvent::Trade {
+                price: 10025,
+                qty: 500,
+                side: Side::Buy,
+                timestamp: 1000000000,
+                trade_id: None,
+            },
+            MarketEvent::Trade {
+                price: 10030,
+                qty: 300,
+                side: Side::Sell,
+                timestamp: 2000000000,
+                trade_id: None,
+            },
+            MarketEvent::Trade {
+                price: 10035,
+                qty: 200,
+                side: Side::Buy,
+                timestamp: 3000000000,
+                trade_id: None,
+            },
+        ];
+
+        // Write and read
+        BinaryDataSource::write_binary_file(temp_file.path(), &events).unwrap();
+        let mut binary_source = BinaryDataSource::new(temp_file.path()).unwrap();
+
+        // Seek to middle timestamp
+        binary_source.seek_to_time(2000000000).unwrap();
+        
+        // Should read the second event
+        let event = binary_source.next_event().unwrap().unwrap();
+        match event {
+            MarketEvent::Trade { price, timestamp, .. } => {
+                assert_eq!(price, 10030);
+                assert_eq!(timestamp, 2000000000);
+            }
+            _ => panic!("Expected Trade event"),
+        }
+    }
+
+    #[test]
+    fn test_binary_playback_speed() {
+        let temp_file = NamedTempFile::new().unwrap();
+        
+        let events = vec![
+            MarketEvent::Trade {
+                price: 10025,
+                qty: 500,
+                side: Side::Buy,
+                timestamp: 1000000000,
+                trade_id: None,
+            },
+        ];
+
+        BinaryDataSource::write_binary_file(temp_file.path(), &events).unwrap();
+        let mut binary_source = BinaryDataSource::new(temp_file.path()).unwrap();
+        
+        // Test setting playback speed
+        binary_source.set_playback_speed(2.0).unwrap();
+        assert_eq!(binary_source.playback_speed, 2.0);
+
+        // Test invalid playback speed
+        assert!(binary_source.set_playback_speed(0.0).is_err());
+        assert!(binary_source.set_playback_speed(-1.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod format_detection_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_format_detection_by_extension() {
+        // Test CSV
+        let csv_file = NamedTempFile::with_suffix(".csv").unwrap();
+        assert_eq!(DataFormatDetector::detect_format(csv_file.path()).unwrap(), DataFormat::Csv);
+
+        // Test JSON
+        let json_file = NamedTempFile::with_suffix(".json").unwrap();
+        assert_eq!(DataFormatDetector::detect_format(json_file.path()).unwrap(), DataFormat::Json);
+
+        let jsonl_file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        assert_eq!(DataFormatDetector::detect_format(jsonl_file.path()).unwrap(), DataFormat::Json);
+
+        // Test Binary
+        let bin_file = NamedTempFile::with_suffix(".bin").unwrap();
+        assert_eq!(DataFormatDetector::detect_format(bin_file.path()).unwrap(), DataFormat::Binary);
+    }
+
+    #[test]
+    fn test_format_detection_by_content() {
+        // Test JSON content
+        let mut json_file = NamedTempFile::new().unwrap();
+        writeln!(json_file, r#"{{"Trade": {{"price": 100}}}}"#).unwrap();
+        json_file.flush().unwrap();
+        assert_eq!(DataFormatDetector::detect_format(json_file.path()).unwrap(), DataFormat::Json);
+
+        // Test CSV content
+        let mut csv_file = NamedTempFile::new().unwrap();
+        writeln!(csv_file, "timestamp,price,qty,side").unwrap();
+        csv_file.flush().unwrap();
+        assert_eq!(DataFormatDetector::detect_format(csv_file.path()).unwrap(), DataFormat::Csv);
+
+        // Test binary content
+        let temp_file = NamedTempFile::new().unwrap();
+        let events = vec![
+            MarketEvent::Trade {
+                price: 10025,
+                qty: 500,
+                side: Side::Buy,
+                timestamp: 1000000000,
+                trade_id: None,
+            },
+        ];
+        BinaryDataSource::write_binary_file(temp_file.path(), &events).unwrap();
+        assert_eq!(DataFormatDetector::detect_format(temp_file.path()).unwrap(), DataFormat::Binary);
+    }
+
+    #[test]
+    fn test_create_data_source() {
+        // Test CSV
+        let mut csv_file = NamedTempFile::with_suffix(".csv").unwrap();
+        writeln!(csv_file, "type,timestamp,price,qty,side").unwrap();
+        writeln!(csv_file, "trade,1000000000,100.25,500,buy").unwrap();
+        csv_file.flush().unwrap();
+
+        let csv_source = DataFormatDetector::create_data_source(csv_file.path()).unwrap();
+        assert_eq!(csv_source.metadata().source_type, "CSV");
+
+        // Test JSON
+        let mut json_file = NamedTempFile::with_suffix(".json").unwrap();
+        writeln!(json_file, r#"{{"Trade": {{"price": 10025, "qty": 500, "side": "Buy", "timestamp": 1000000000, "trade_id": null}}}}"#).unwrap();
+        json_file.flush().unwrap();
+
+        let json_source = DataFormatDetector::create_data_source(json_file.path()).unwrap();
+        assert_eq!(json_source.metadata().source_type, "JSON");
+
+        // Test Binary
+        let temp_file = NamedTempFile::with_suffix(".bin").unwrap();
+        let events = vec![
+            MarketEvent::Trade {
+                price: 10025,
+                qty: 500,
+                side: Side::Buy,
+                timestamp: 1000000000,
+                trade_id: None,
+            },
+        ];
+        BinaryDataSource::write_binary_file(temp_file.path(), &events).unwrap();
+
+        let binary_source = DataFormatDetector::create_data_source(temp_file.path()).unwrap();
+        assert_eq!(binary_source.metadata().source_type, "Binary");
     }
 }
