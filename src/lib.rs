@@ -2,6 +2,8 @@ pub mod types;
 pub mod time;
 pub mod error;
 pub mod logging;
+pub mod queue;
+pub mod queue_fifo;
 
 // Re-export core types for convenience
 pub use types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
@@ -17,3 +19,7 @@ pub use time::{now_ns, ms_to_ns, ns_to_ms, ns_to_secs, secs_to_ns, elapsed_ns, f
 
 // Re-export logging functions
 pub use logging::{init_logging, init_test_logging, log_engine_error, log_order_operation, log_trade};
+
+// Re-export queue discipline trait and implementations
+pub use queue::QueueDiscipline;
+pub use queue_fifo::FifoLevel;
