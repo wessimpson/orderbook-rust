@@ -1,4 +1,4 @@
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug, trace};
 use tracing_subscriber::{
     fmt,
     layer::SubscriberExt,
@@ -6,6 +6,7 @@ use tracing_subscriber::{
     EnvFilter,
 };
 use crate::error::EngineError;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Initialize the logging system with appropriate filters and formatting
 pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
@@ -144,6 +145,143 @@ pub fn log_websocket_event(event: &str, client_id: Option<&str>, details: Option
             );
         }
     }
+}
+
+/// Log system health metrics
+pub fn log_health_metric(metric_name: &str, value: f64, threshold: Option<f64>, status: &str) {
+    if let Some(threshold) = threshold {
+        info!(
+            metric = metric_name,
+            value = value,
+            threshold = threshold,
+            status = status,
+            "Health metric"
+        );
+    } else {
+        info!(
+            metric = metric_name,
+            value = value,
+            status = status,
+            "Health metric"
+        );
+    }
+}
+
+/// Log connection pool status
+pub fn log_connection_status(active_connections: usize, max_connections: Option<usize>) {
+    if let Some(max) = max_connections {
+        info!(
+            active_connections = active_connections,
+            max_connections = max,
+            utilization = (active_connections as f64 / max as f64) * 100.0,
+            "Connection pool status"
+        );
+    } else {
+        info!(
+            active_connections = active_connections,
+            "Connection pool status"
+        );
+    }
+}
+
+/// Log simulation step performance
+pub fn log_simulation_step(step_duration_ms: f64, trades_generated: usize, orders_processed: usize) {
+    debug!(
+        step_duration_ms = step_duration_ms,
+        trades_generated = trades_generated,
+        orders_processed = orders_processed,
+        "Simulation step completed"
+    );
+}
+
+/// Log order book state changes
+pub fn log_order_book_state(best_bid: Option<u64>, best_ask: Option<u64>, spread: Option<i64>, total_orders: usize) {
+    trace!(
+        best_bid = best_bid,
+        best_ask = best_ask,
+        spread = spread,
+        total_orders = total_orders,
+        "Order book state"
+    );
+}
+
+/// Log data ingestion events
+pub fn log_data_ingestion(source: &str, events_processed: usize, errors: usize, duration_ms: f64) {
+    info!(
+        source = source,
+        events_processed = events_processed,
+        errors = errors,
+        duration_ms = duration_ms,
+        processing_rate = events_processed as f64 / (duration_ms / 1000.0),
+        "Data ingestion completed"
+    );
+}
+
+/// Log critical system errors that require immediate attention
+pub fn log_critical_error(component: &str, error: &str, context: Option<&str>) {
+    if let Some(ctx) = context {
+        error!(
+            component = component,
+            error = error,
+            context = ctx,
+            severity = "CRITICAL",
+            "Critical system error - immediate attention required"
+        );
+    } else {
+        error!(
+            component = component,
+            error = error,
+            severity = "CRITICAL",
+            "Critical system error - immediate attention required"
+        );
+    }
+}
+
+/// Log system recovery events
+pub fn log_recovery_event(component: &str, action: &str, success: bool, duration_ms: Option<f64>) {
+    if let Some(duration) = duration_ms {
+        if success {
+            info!(
+                component = component,
+                action = action,
+                success = success,
+                duration_ms = duration,
+                "System recovery completed"
+            );
+        } else {
+            warn!(
+                component = component,
+                action = action,
+                success = success,
+                duration_ms = duration,
+                "System recovery failed"
+            );
+        }
+    } else {
+        if success {
+            info!(
+                component = component,
+                action = action,
+                success = success,
+                "System recovery completed"
+            );
+        } else {
+            warn!(
+                component = component,
+                action = action,
+                success = success,
+                "System recovery failed"
+            );
+        }
+    }
+}
+
+/// Get current timestamp for logging
+pub fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

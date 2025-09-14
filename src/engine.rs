@@ -166,25 +166,72 @@ impl<D: QueueDiscipline> OrderBook<D> {
 
     /// Validate an order before processing
     fn validate_order(&self, order: &Order) -> EngineResult<()> {
-        // Check quantity
+        use crate::logging::log_order_operation;
+        
+        // Check quantity bounds
         if order.qty == 0 {
+            log_order_operation("VALIDATION_FAILED", order.id, Some("Zero quantity"));
             return Err(EngineError::InvalidQty { qty: order.qty });
+        }
+
+        // Check maximum quantity limit (prevent overflow and unrealistic orders)
+        const MAX_QTY: Qty = 1_000_000_000; // 1 billion shares max
+        if order.qty > MAX_QTY {
+            log_order_operation("VALIDATION_FAILED", order.id, Some(&format!("Quantity {} exceeds maximum {}", order.qty, MAX_QTY)));
+            return Err(EngineError::QtyTooLarge { 
+                qty: order.qty, 
+                max_qty: MAX_QTY 
+            });
         }
 
         // Check price for limit orders
         if let OrderType::Limit { price } = order.order_type {
             if price == 0 {
+                log_order_operation("VALIDATION_FAILED", order.id, Some("Zero price for limit order"));
                 return Err(EngineError::InvalidPrice { price });
+            }
+
+            // Check price bounds (prevent overflow and unrealistic prices)
+            const MIN_PRICE: Price = 1; // Minimum 1 tick
+            const MAX_PRICE: Price = 100_000_000; // $10,000 per share max (in ticks)
+            
+            if price < MIN_PRICE || price > MAX_PRICE {
+                log_order_operation("VALIDATION_FAILED", order.id, Some(&format!("Price {} outside valid range [{}, {}]", price, MIN_PRICE, MAX_PRICE)));
+                return Err(EngineError::PriceOutOfRange {
+                    price,
+                    min_price: MIN_PRICE,
+                    max_price: MAX_PRICE,
+                });
             }
         }
 
         // Check for duplicate order ID
         if self.order_index.contains_key(&order.id) {
+            log_order_operation("VALIDATION_FAILED", order.id, Some("Duplicate order ID"));
             return Err(EngineError::reject(format!(
                 "Order ID {} already exists", order.id
             )));
         }
 
+        // Check timestamp is reasonable (not too far in the past or future)
+        let current_ts = crate::time::now_ns();
+        let one_hour_ns = 3_600_000_000_000u128; // 1 hour in nanoseconds
+        
+        if order.ts > current_ts + one_hour_ns {
+            log_order_operation("VALIDATION_FAILED", order.id, Some("Timestamp too far in future"));
+            return Err(EngineError::reject(format!(
+                "Order timestamp {} is too far in the future", order.ts
+            )));
+        }
+        
+        if current_ts > order.ts + one_hour_ns {
+            log_order_operation("VALIDATION_FAILED", order.id, Some("Timestamp too far in past"));
+            return Err(EngineError::reject(format!(
+                "Order timestamp {} is too far in the past", order.ts
+            )));
+        }
+
+        log_order_operation("VALIDATION_PASSED", order.id, Some(&format!("{:?} {} @ {:?}", order.side, order.qty, order.order_type)));
         Ok(())
     }
 
@@ -458,55 +505,127 @@ impl<D: QueueDiscipline> OrderBook<D> {
 
 impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
     fn place(&mut self, order: Order) -> EngineResult<Vec<Trade>> {
+        use crate::logging::{log_order_operation, log_trade, log_engine_error};
+        
+        let order_id = order.id;
+        let start_time = std::time::Instant::now();
+        
         // Validate the order
-        self.validate_order(&order)?;
+        if let Err(e) = self.validate_order(&order) {
+            log_engine_error(&e, Some(&format!("Order {} validation", order_id)));
+            return Err(e);
+        }
 
         // Process based on order type
-        match order.order_type {
-            OrderType::Limit { price } => self.process_limit_order(order, price),
-            OrderType::Market => self.process_market_order(order),
+        let result = match order.order_type {
+            OrderType::Limit { price } => {
+                log_order_operation("PLACE_LIMIT", order_id, Some(&format!("{:?} {} @ {}", order.side, order.qty, price)));
+                self.process_limit_order(order, price)
+            },
+            OrderType::Market => {
+                log_order_operation("PLACE_MARKET", order_id, Some(&format!("{:?} {}", order.side, order.qty)));
+                self.process_market_order(order)
+            },
+        };
+
+        let processing_time = start_time.elapsed();
+        
+        match &result {
+            Ok(trades) => {
+                if trades.is_empty() {
+                    log_order_operation("PLACED_NO_FILL", order_id, Some(&format!("Processing time: {:?}", processing_time)));
+                } else {
+                    log_order_operation("PLACED_WITH_FILLS", order_id, Some(&format!("{} trades, Processing time: {:?}", trades.len(), processing_time)));
+                    
+                    // Log each trade
+                    for trade in trades {
+                        log_trade(trade.maker_id, trade.taker_id, trade.price, trade.qty, trade.ts);
+                    }
+                }
+            }
+            Err(e) => {
+                log_engine_error(e, Some(&format!("Order {} placement failed after {:?}", order_id, processing_time)));
+            }
         }
+
+        result
     }
 
     fn cancel(&mut self, order_id: OrderId) -> EngineResult<Qty> {
+        use crate::logging::{log_order_operation, log_engine_error};
+        
+        let start_time = std::time::Instant::now();
+        
         // Look up order in index
-        let (side, price) = self.order_index.remove(&order_id)
-            .ok_or(EngineError::UnknownOrder { order_id })?;
+        let (side, price) = match self.order_index.remove(&order_id) {
+            Some(location) => {
+                log_order_operation("CANCEL_LOOKUP_SUCCESS", order_id, Some(&format!("{:?} @ {}", location.0, location.1)));
+                location
+            }
+            None => {
+                let error = EngineError::UnknownOrder { order_id };
+                log_engine_error(&error, Some("Order cancellation lookup"));
+                return Err(error);
+            }
+        };
 
         // Cancel from appropriate side
         let cancelled_qty = match side {
             Side::Buy => {
-                let level = self.bids.get_mut(&Reverse(price))
-                    .ok_or(EngineError::internal("Order index inconsistency: bid level not found"))?;
+                let level = match self.bids.get_mut(&Reverse(price)) {
+                    Some(level) => level,
+                    None => {
+                        // Restore order index entry since we failed
+                        self.order_index.insert(order_id, (side, price));
+                        let error = EngineError::internal("Order index inconsistency: bid level not found");
+                        log_engine_error(&error, Some(&format!("Order {} cancel", order_id)));
+                        return Err(error);
+                    }
+                };
                 
                 let qty = level.cancel(order_id);
                 
                 // Remove level if empty
                 if level.is_empty() {
                     self.bids.remove(&Reverse(price));
+                    log_order_operation("LEVEL_REMOVED", order_id, Some(&format!("Bid level @ {} now empty", price)));
                 }
                 
                 qty
             }
             Side::Sell => {
-                let level = self.asks.get_mut(&price)
-                    .ok_or(EngineError::internal("Order index inconsistency: ask level not found"))?;
+                let level = match self.asks.get_mut(&price) {
+                    Some(level) => level,
+                    None => {
+                        // Restore order index entry since we failed
+                        self.order_index.insert(order_id, (side, price));
+                        let error = EngineError::internal("Order index inconsistency: ask level not found");
+                        log_engine_error(&error, Some(&format!("Order {} cancel", order_id)));
+                        return Err(error);
+                    }
+                };
                 
                 let qty = level.cancel(order_id);
                 
                 // Remove level if empty
                 if level.is_empty() {
                     self.asks.remove(&price);
+                    log_order_operation("LEVEL_REMOVED", order_id, Some(&format!("Ask level @ {} now empty", price)));
                 }
                 
                 qty
             }
         };
 
+        let processing_time = start_time.elapsed();
+
         if cancelled_qty == 0 {
-            return Err(EngineError::UnknownOrder { order_id });
+            let error = EngineError::UnknownOrder { order_id };
+            log_engine_error(&error, Some(&format!("Order found in index but not in level after {:?}", processing_time)));
+            return Err(error);
         }
 
+        log_order_operation("CANCELLED", order_id, Some(&format!("Qty: {}, Processing time: {:?}", cancelled_qty, processing_time)));
         Ok(cancelled_qty)
     }
 

@@ -411,7 +411,12 @@ impl<E: OrderBookEngine> Simulator<E> {
 
     /// Run one simulation step
     pub fn step(&mut self) -> EngineResult<Vec<Trade>> {
+        use crate::logging::{log_engine_error, log_data_ingestion};
+        
+        let step_start = std::time::Instant::now();
         let mut all_trades = Vec::new();
+        let mut orders_processed = 0;
+        let mut errors_encountered = 0;
         
         // Advance simulation time
         let time_advance = self.rng.gen_range(
@@ -426,18 +431,39 @@ impl<E: OrderBookEngine> Simulator<E> {
                 if let Some(ref mut data_source) = self.data_source {
                     match data_source.next_event() {
                         Ok(Some(event)) => {
+                            orders_processed += 1;
                             self.current_time = event.timestamp();
-                            let trades = self.process_market_event(event)?;
-                            if !trades.is_empty() {
-                                self.update_metrics(&trades, Side::Buy); // Assume buy side for simplicity
-                                all_trades.extend(trades);
+                            
+                            match self.process_market_event(event) {
+                                Ok(trades) => {
+                                    if !trades.is_empty() {
+                                        self.update_metrics(&trades, Side::Buy); // Assume buy side for simplicity
+                                        all_trades.extend(trades);
+                                    }
+                                }
+                                Err(e) => {
+                                    errors_encountered += 1;
+                                    log_engine_error(&e, Some("Historical data processing"));
+                                    
+                                    // Continue processing unless it's a critical error
+                                    if !e.is_recoverable() {
+                                        return Err(e);
+                                    }
+                                }
                             }
                         }
                         Ok(None) => {
-                            // End of data - could switch to synthetic mode or stop
+                            // End of data - log completion
+                            tracing::info!("Historical data replay completed");
                         }
-                        Err(_) => {
-                            // Data error - could log and continue with synthetic mode
+                        Err(e) => {
+                            errors_encountered += 1;
+                            let engine_error = crate::error::EngineError::data(format!("Data source error: {}", e));
+                            log_engine_error(&engine_error, Some("Data source reading"));
+                            
+                            // Switch to synthetic mode on data errors
+                            tracing::warn!("Switching to synthetic mode due to data source error");
+                            self.mode = SimulationMode::Synthetic;
                         }
                     }
                 }
@@ -448,22 +474,44 @@ impl<E: OrderBookEngine> Simulator<E> {
                 // Market making orders
                 let mm_orders = self.generate_market_making_orders();
                 for order in mm_orders {
+                    orders_processed += 1;
                     self.simulate_network_latency();
+                    
                     if !self.net.should_drop(&mut self.rng) {
                         let order_side = order.side;
-                        let trades = self.engine.place(order)?;
-                        if !trades.is_empty() {
-                            self.update_metrics(&trades, order_side);
-                            all_trades.extend(trades);
+                        let order_id = order.id;
+                        
+                        match self.engine.place(order) {
+                            Ok(trades) => {
+                                if !trades.is_empty() {
+                                    self.update_metrics(&trades, order_side);
+                                    all_trades.extend(trades);
+                                }
+                            }
+                            Err(e) => {
+                                errors_encountered += 1;
+                                log_engine_error(&e, Some(&format!("Market maker order {}", order_id)));
+                                
+                                // Continue unless critical error
+                                if !e.is_recoverable() {
+                                    return Err(e);
+                                }
+                            }
                         }
+                    } else {
+                        tracing::trace!("Market maker order dropped due to network simulation");
                     }
                 }
                 
                 // Market taker orders
                 if let Some(taker_order) = self.generate_market_taker_order() {
+                    orders_processed += 1;
                     self.simulate_network_latency();
+                    
                     if !self.net.should_drop(&mut self.rng) {
                         let taker_side = taker_order.side;
+                        let order_id = taker_order.id;
+                        
                         match self.engine.place(taker_order) {
                             Ok(trades) => {
                                 if !trades.is_empty() {
@@ -472,10 +520,17 @@ impl<E: OrderBookEngine> Simulator<E> {
                                 }
                             }
                             Err(e) => {
-                                // Log error but continue simulation
-                                tracing::debug!("Taker order failed: {}", e);
+                                errors_encountered += 1;
+                                log_engine_error(&e, Some(&format!("Market taker order {}", order_id)));
+                                
+                                // Continue unless critical error
+                                if !e.is_recoverable() {
+                                    return Err(e);
+                                }
                             }
                         }
+                    } else {
+                        tracing::trace!("Market taker order dropped due to network simulation");
                     }
                 }
             }
@@ -483,12 +538,35 @@ impl<E: OrderBookEngine> Simulator<E> {
                 // Combine historical data with synthetic orders
                 // First try to process historical event
                 if let Some(ref mut data_source) = self.data_source {
-                    if let Ok(Some(event)) = data_source.next_event() {
-                        self.current_time = event.timestamp();
-                        let trades = self.process_market_event(event)?;
-                        if !trades.is_empty() {
-                            self.update_metrics(&trades, Side::Buy);
-                            all_trades.extend(trades);
+                    match data_source.next_event() {
+                        Ok(Some(event)) => {
+                            orders_processed += 1;
+                            self.current_time = event.timestamp();
+                            
+                            match self.process_market_event(event) {
+                                Ok(trades) => {
+                                    if !trades.is_empty() {
+                                        self.update_metrics(&trades, Side::Buy);
+                                        all_trades.extend(trades);
+                                    }
+                                }
+                                Err(e) => {
+                                    errors_encountered += 1;
+                                    log_engine_error(&e, Some("Hybrid mode historical processing"));
+                                    
+                                    if !e.is_recoverable() {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // End of historical data, continue with synthetic only
+                        }
+                        Err(e) => {
+                            errors_encountered += 1;
+                            let engine_error = crate::error::EngineError::data(format!("Hybrid mode data error: {}", e));
+                            log_engine_error(&engine_error, Some("Hybrid mode data source"));
                         }
                     }
                 }
@@ -497,13 +575,28 @@ impl<E: OrderBookEngine> Simulator<E> {
                 if self.rng.gen::<f64>() < 0.5 {  // 50% chance of synthetic order
                     let mm_orders = self.generate_market_making_orders();
                     for order in mm_orders {
+                        orders_processed += 1;
                         self.simulate_network_latency();
+                        
                         if !self.net.should_drop(&mut self.rng) {
                             let order_side = order.side;
-                            let trades = self.engine.place(order)?;
-                            if !trades.is_empty() {
-                                self.update_metrics(&trades, order_side);
-                                all_trades.extend(trades);
+                            let order_id = order.id;
+                            
+                            match self.engine.place(order) {
+                                Ok(trades) => {
+                                    if !trades.is_empty() {
+                                        self.update_metrics(&trades, order_side);
+                                        all_trades.extend(trades);
+                                    }
+                                }
+                                Err(e) => {
+                                    errors_encountered += 1;
+                                    log_engine_error(&e, Some(&format!("Hybrid mode synthetic order {}", order_id)));
+                                    
+                                    if !e.is_recoverable() {
+                                        return Err(e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -515,6 +608,20 @@ impl<E: OrderBookEngine> Simulator<E> {
         if !all_trades.is_empty() {
             self.update_spread_history();
         }
+        
+        // Log step completion metrics
+        let step_duration = step_start.elapsed();
+        if errors_encountered > 0 {
+            tracing::warn!("Simulation step completed with {} errors out of {} orders in {:?}", 
+                          errors_encountered, orders_processed, step_duration);
+        } else if orders_processed > 0 {
+            tracing::trace!("Simulation step: {} orders, {} trades in {:?}", 
+                           orders_processed, all_trades.len(), step_duration);
+        }
+        
+        // Log performance data for monitoring
+        let step_duration_ms = step_duration.as_millis() as f64;
+        log_data_ingestion("simulation_step", orders_processed, errors_encountered, step_duration_ms);
         
         Ok(all_trades)
     }
@@ -543,7 +650,44 @@ impl<E: OrderBookEngine> Simulator<E> {
         snapshot
     }
 
-    /// Get current metrics
+    /// Place an order directly (for testing or manual intervention)
+    pub fn place_order(&mut self, order: Order) -> EngineResult<Vec<Trade>> {
+        use crate::logging::log_order_operation;
+        
+        log_order_operation("MANUAL_PLACE", order.id, Some("Direct order placement"));
+        
+        match self.engine.place(order) {
+            Ok(trades) => {
+                if !trades.is_empty() {
+                    // Update metrics based on the order side (assume buy side for manual orders)
+                    self.update_metrics(&trades, Side::Buy);
+                    self.update_spread_history();
+                }
+                Ok(trades)
+            }
+            Err(e) => {
+                use crate::logging::log_engine_error;
+                log_engine_error(&e, Some("Manual order placement"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Reset simulation metrics
+    pub fn reset_metrics(&mut self) {
+        use crate::logging::log_startup;
+        
+        self.metrics = Metrics::new();
+        self.recent_spreads.clear();
+        log_startup("Simulator", Some("Metrics reset"));
+    }
+
+    /// Get current simulation time
+    pub fn current_time(&self) -> u128 {
+        self.current_time
+    }
+
+    /// Get simulation metrics
     pub fn get_metrics(&self) -> &Metrics {
         &self.metrics
     }
@@ -558,11 +702,6 @@ impl<E: OrderBookEngine> Simulator<E> {
         if let Some(ref mut data_source) = self.data_source {
             let _ = data_source.reset();
         }
-    }
-
-    /// Get current simulation time
-    pub fn current_time(&self) -> u128 {
-        self.current_time
     }
 
     /// Set simulation time (useful for testing)
