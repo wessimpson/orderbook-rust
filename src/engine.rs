@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::cmp::Reverse;
+use std::sync::Arc;
+use std::time::Instant;
 use crate::types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
 use crate::error::{EngineError, EngineResult};
 use crate::queue::QueueDiscipline;
 use crate::time::now_ns;
+use crate::metrics::PerformanceMetrics;
+use crate::memory::CircularBuffer;
 use serde::{Deserialize, Serialize};
 
 /// Market data snapshot for visualization and analysis
@@ -135,10 +139,13 @@ pub struct OrderBook<D: QueueDiscipline> {
     
     /// Rolling history of spread values for visualization
     /// Tuple format: (timestamp, spread_in_ticks)
-    recent_spreads: Vec<(u128, i64)>,
+    recent_spreads: CircularBuffer<(u128, i64)>,
     
     /// Trading performance metrics
     metrics: crate::types::Metrics,
+    
+    /// Performance monitoring (optional)
+    perf_metrics: Option<Arc<PerformanceMetrics>>,
 }
 
 impl<D: QueueDiscipline + Default> OrderBook<D> {
@@ -159,8 +166,22 @@ impl<D: QueueDiscipline> OrderBook<D> {
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
             level_factory,
-            recent_spreads: Vec::new(),
+            recent_spreads: CircularBuffer::new(400),
             metrics: crate::types::Metrics::new(),
+            perf_metrics: None,
+        }
+    }
+
+    /// Create a new order book with performance monitoring
+    pub fn with_performance_monitoring(level_factory: fn() -> D, perf_metrics: Arc<PerformanceMetrics>) -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            order_index: HashMap::new(),
+            level_factory,
+            recent_spreads: CircularBuffer::new(400),
+            metrics: crate::types::Metrics::new(),
+            perf_metrics: Some(perf_metrics),
         }
     }
 
@@ -469,11 +490,6 @@ impl<D: QueueDiscipline> OrderBook<D> {
         if let Some(spread) = self.spread() {
             let ts = now_ns();
             self.recent_spreads.push((ts, spread));
-            
-            // Keep only last 400 data points for performance
-            if self.recent_spreads.len() > 400 {
-                self.recent_spreads.remove(0);
-            }
         }
     }
 
@@ -489,7 +505,7 @@ impl<D: QueueDiscipline> OrderBook<D> {
 
     /// Get a copy of recent spreads for snapshot
     fn get_recent_spreads(&self) -> Vec<(u128, i64)> {
-        self.recent_spreads.clone()
+        self.recent_spreads.to_vec()
     }
 
     /// Get current metrics
@@ -508,11 +524,17 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
         use crate::logging::{log_order_operation, log_trade, log_engine_error};
         
         let order_id = order.id;
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
         
         // Validate the order
         if let Err(e) = self.validate_order(&order) {
             log_engine_error(&e, Some(&format!("Order {} validation", order_id)));
+            
+            // Record failed order in performance metrics
+            if let Some(ref perf_metrics) = self.perf_metrics {
+                perf_metrics.record_order_placement(start_time.elapsed(), false);
+            }
+            
             return Err(e);
         }
 
@@ -532,6 +554,12 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
         
         match &result {
             Ok(trades) => {
+                // Record successful order in performance metrics
+                if let Some(ref perf_metrics) = self.perf_metrics {
+                    perf_metrics.record_order_placement(processing_time, true);
+                    perf_metrics.record_trade(trades.len());
+                }
+                
                 if trades.is_empty() {
                     log_order_operation("PLACED_NO_FILL", order_id, Some(&format!("Processing time: {:?}", processing_time)));
                 } else {
@@ -544,6 +572,11 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
                 }
             }
             Err(e) => {
+                // Record failed order in performance metrics
+                if let Some(ref perf_metrics) = self.perf_metrics {
+                    perf_metrics.record_order_placement(processing_time, false);
+                }
+                
                 log_engine_error(e, Some(&format!("Order {} placement failed after {:?}", order_id, processing_time)));
             }
         }
@@ -554,7 +587,7 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
     fn cancel(&mut self, order_id: OrderId) -> EngineResult<Qty> {
         use crate::logging::{log_order_operation, log_engine_error};
         
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
         
         // Look up order in index
         let (side, price) = match self.order_index.remove(&order_id) {
@@ -565,6 +598,12 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
             None => {
                 let error = EngineError::UnknownOrder { order_id };
                 log_engine_error(&error, Some("Order cancellation lookup"));
+                
+                // Record failed cancellation in performance metrics
+                if let Some(ref perf_metrics) = self.perf_metrics {
+                    perf_metrics.record_order_cancellation(start_time.elapsed(), false);
+                }
+                
                 return Err(error);
             }
         };
@@ -579,6 +618,12 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
                         self.order_index.insert(order_id, (side, price));
                         let error = EngineError::internal("Order index inconsistency: bid level not found");
                         log_engine_error(&error, Some(&format!("Order {} cancel", order_id)));
+                        
+                        // Record failed cancellation in performance metrics
+                        if let Some(ref perf_metrics) = self.perf_metrics {
+                            perf_metrics.record_order_cancellation(start_time.elapsed(), false);
+                        }
+                        
                         return Err(error);
                     }
                 };
@@ -601,6 +646,12 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
                         self.order_index.insert(order_id, (side, price));
                         let error = EngineError::internal("Order index inconsistency: ask level not found");
                         log_engine_error(&error, Some(&format!("Order {} cancel", order_id)));
+                        
+                        // Record failed cancellation in performance metrics
+                        if let Some(ref perf_metrics) = self.perf_metrics {
+                            perf_metrics.record_order_cancellation(start_time.elapsed(), false);
+                        }
+                        
                         return Err(error);
                     }
                 };
@@ -622,7 +673,18 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
         if cancelled_qty == 0 {
             let error = EngineError::UnknownOrder { order_id };
             log_engine_error(&error, Some(&format!("Order found in index but not in level after {:?}", processing_time)));
+            
+            // Record failed cancellation in performance metrics
+            if let Some(ref perf_metrics) = self.perf_metrics {
+                perf_metrics.record_order_cancellation(processing_time, false);
+            }
+            
             return Err(error);
+        }
+
+        // Record successful cancellation in performance metrics
+        if let Some(ref perf_metrics) = self.perf_metrics {
+            perf_metrics.record_order_cancellation(processing_time, true);
         }
 
         log_order_operation("CANCELLED", order_id, Some(&format!("Qty: {}, Processing time: {:?}", cancelled_qty, processing_time)));
@@ -653,6 +715,8 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
     }
 
     fn snapshot(&self) -> DepthSnapshot {
+        let start_time = Instant::now();
+        
         let ts = now_ns();
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
@@ -679,7 +743,7 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
             })
             .collect();
 
-        DepthSnapshot {
+        let snapshot = DepthSnapshot {
             ts,
             best_bid,
             best_ask,
@@ -689,7 +753,14 @@ impl<D: QueueDiscipline> OrderBookEngine for OrderBook<D> {
             asks,
             recent_spreads: self.get_recent_spreads(),
             metrics: self.metrics.clone(),
+        };
+
+        // Record snapshot generation time in performance metrics
+        if let Some(ref perf_metrics) = self.perf_metrics {
+            perf_metrics.record_snapshot_generation(start_time.elapsed());
         }
+
+        snapshot
     }
 }
 

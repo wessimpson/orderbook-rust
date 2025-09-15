@@ -1,0 +1,198 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Order Book Performance Dashboard",
+    "tags": ["orderbook", "performance", "trading"],
+    "style": "dark",
+    "timezone": "browser",
+    "refresh": "5s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Order Processing Rate",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rate(orders_processed_total[1m])",
+            "legendFormat": "Orders/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ops",
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "yellow", "value": 1000},
+                {"color": "green", "value": 10000}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Order Placement Latency",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(order_placement_duration_ns_bucket[5m])) / 1000000",
+            "legendFormat": "p50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(order_placement_duration_ns_bucket[5m])) / 1000000",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(order_placement_duration_ns_bucket[5m])) / 1000000",
+            "legendFormat": "p99"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Latency (ms)",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Memory Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "memory_usage_bytes / 1024 / 1024",
+            "legendFormat": "Memory (MB)"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Memory (MB)",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "Trade Generation Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(trades_generated_total[1m])",
+            "legendFormat": "Trades/sec"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Trades/sec",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 5,
+        "title": "Error Rates",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(orders_failed_total[5m]) / rate(orders_processed_total[5m]) * 100",
+            "legendFormat": "Order Failure Rate (%)"
+          },
+          {
+            "expr": "rate(ingestion_errors_total[5m]) / rate(events_ingested_total[5m]) * 100",
+            "legendFormat": "Ingestion Error Rate (%)"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Error Rate (%)",
+            "logBase": 1,
+            "min": 0,
+            "max": 100
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 6,
+        "title": "Data Ingestion Rate",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rate(events_ingested_total[1m])",
+            "legendFormat": "Events/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ops",
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "yellow", "value": 10000},
+                {"color": "green", "value": 100000}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 6, "x": 0, "y": 16}
+      },
+      {
+        "id": 7,
+        "title": "CPU Usage",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "cpu_usage_percent",
+            "legendFormat": "CPU %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": 0},
+                {"color": "yellow", "value": 70},
+                {"color": "red", "value": 90}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 6, "x": 6, "y": 16}
+      },
+      {
+        "id": 8,
+        "title": "Snapshot Generation Latency",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(snapshot_generation_duration_ns_bucket[5m])) / 1000000",
+            "legendFormat": "p95 Snapshot Latency (ms)"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Latency (ms)",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ]
+  }
+}

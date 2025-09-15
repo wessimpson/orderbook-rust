@@ -1,0 +1,27 @@
+# Prometheus configuration for Order Book monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "orderbook_rules.yml"
+
+scrape_configs:
+  # Order Book application metrics
+  - job_name: 'orderbook'
+    static_configs:
+      - targets: ['localhost:3001']
+    scrape_interval: 5s
+    metrics_path: /metrics
+    
+  # System metrics (if node_exporter is available)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+    scrape_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093

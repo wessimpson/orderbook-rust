@@ -9,6 +9,8 @@ pub mod data;
 pub mod sim;
 pub mod server;
 pub mod config;
+pub mod metrics;
+pub mod memory;
 
 // Re-export core types for convenience
 pub use types::{Order, OrderId, OrderType, Price, Qty, Side, Trade};
@@ -43,3 +45,9 @@ pub use server::{AppState, start_server, create_router, start_simulation_loop};
 
 // Re-export configuration types
 pub use config::{Config, ServerConfig, SimulationConfig, DataSourceConfig, LoggingConfig, ConfigError};
+
+// Re-export metrics types
+pub use metrics::{PerformanceMetrics, PerformanceSnapshot, PerformanceMonitor, init_metrics_exporter};
+
+// Re-export memory management types
+pub use memory::{CircularBuffer, OrderPool, StringInterner, MemoryTracker};

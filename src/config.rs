@@ -250,7 +250,7 @@ impl Config {
     }
     
     /// Validate configuration values
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate server configuration
         if self.server.port == 0 {
             return Err(ConfigError::ValidationError("Server port cannot be 0".to_string()));

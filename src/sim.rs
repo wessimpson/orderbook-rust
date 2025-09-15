@@ -3,6 +3,7 @@ use crate::data::{DataSource, MarketEvent};
 use crate::types::{Order, OrderId, Price, Qty, Side, Trade, Metrics, price_utils};
 use crate::time::now_ns;
 use crate::error::EngineResult;
+use crate::memory::CircularBuffer;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,7 @@ pub struct Simulator<E: OrderBookEngine> {
     /// Trading performance metrics
     pub metrics: Metrics,
     /// Rolling spread history for visualization
-    pub recent_spreads: Vec<(u128, i64)>,
+    pub recent_spreads: CircularBuffer<(u128, i64)>,
     /// Next order ID to assign
     next_order_id: OrderId,
     /// Current simulation timestamp
@@ -168,7 +169,7 @@ impl<E: OrderBookEngine> Simulator<E> {
             rng: StdRng::seed_from_u64(seed),
             net: NetModel::default(),
             metrics: Metrics::new(),
-            recent_spreads: Vec::new(),
+            recent_spreads: CircularBuffer::new(400),
             next_order_id: 1,
             current_time: now_ns(),
             data_source: None,
@@ -391,11 +392,6 @@ impl<E: OrderBookEngine> Simulator<E> {
     fn update_spread_history(&mut self) {
         if let Some(spread) = self.engine.spread() {
             self.recent_spreads.push((self.current_time, spread));
-            
-            // Keep only last 400 data points for performance
-            if self.recent_spreads.len() > 400 {
-                self.recent_spreads.remove(0);
-            }
         }
     }
 
@@ -644,7 +640,7 @@ impl<E: OrderBookEngine> Simulator<E> {
         
         // Override with simulator's metrics and spread history
         snapshot.metrics = self.metrics.clone();
-        snapshot.recent_spreads = self.recent_spreads.clone();
+        snapshot.recent_spreads = self.recent_spreads.to_vec();
         snapshot.ts = self.current_time;
         
         snapshot

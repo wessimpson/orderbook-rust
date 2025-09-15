@@ -1,10 +1,12 @@
 use crate::types::{Order, OrderId, Price, Qty, Side, price_utils};
+use crate::metrics::PerformanceMetrics;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::io::BufRead;
+use std::sync::Arc;
 use csv::{Reader, StringRecord};
 
 /// Errors that can occur during data ingestion
@@ -452,6 +454,8 @@ pub struct CsvDataSource {
     finished: bool,
     /// Buffer for the next record
     record_buffer: StringRecord,
+    /// Performance metrics (optional)
+    perf_metrics: Option<Arc<PerformanceMetrics>>,
 }
 
 impl CsvDataSource {
@@ -484,7 +488,14 @@ impl CsvDataSource {
             metadata,
             finished: false,
             record_buffer: StringRecord::new(),
+            perf_metrics: None,
         })
+    }
+
+    /// Set performance metrics for monitoring
+    pub fn with_performance_monitoring(mut self, perf_metrics: Arc<PerformanceMetrics>) -> Self {
+        self.perf_metrics = Some(perf_metrics);
+        self
     }
 
     /// Parse a CSV record into a MarketEvent
@@ -829,6 +840,10 @@ impl CsvDataSource {
 
 impl DataSource for CsvDataSource {
     fn next_event(&mut self) -> DataResult<Option<MarketEvent>> {
+        let start_time = Instant::now();
+        let events_processed;
+        let mut errors_encountered = 0;
+        
         if self.finished {
             return Ok(None);
         }
@@ -840,18 +855,54 @@ impl DataSource for CsvDataSource {
         }
 
         self.current_line += 1;
+        events_processed = 1;
 
         // Parse the record
-        let event = self.parse_record(&self.record_buffer)?;
+        let event = match self.parse_record(&self.record_buffer) {
+            Ok(event) => event,
+            Err(e) => {
+                errors_encountered = 1;
+                
+                // Record performance metrics
+                if let Some(ref perf_metrics) = self.perf_metrics {
+                    perf_metrics.record_data_ingestion(start_time.elapsed(), events_processed, errors_encountered);
+                }
+                
+                return Err(e);
+            }
+        };
         
         // Validate the event
-        event.validate()?;
+        if let Err(e) = event.validate() {
+            errors_encountered = 1;
+            
+            // Record performance metrics
+            if let Some(ref perf_metrics) = self.perf_metrics {
+                perf_metrics.record_data_ingestion(start_time.elapsed(), events_processed, errors_encountered);
+            }
+            
+            return Err(e);
+        }
 
         // Update current position
         self.current_position = Some(event.timestamp());
 
         // Handle timing for playback speed
-        self.handle_timing(event.timestamp())?;
+        if let Err(e) = self.handle_timing(event.timestamp()) {
+            errors_encountered = 1;
+            
+            // Record performance metrics
+            if let Some(ref perf_metrics) = self.perf_metrics {
+                perf_metrics.record_data_ingestion(start_time.elapsed(), events_processed, errors_encountered);
+            }
+            
+            return Err(e);
+        }
+
+        // Record successful ingestion in performance metrics
+        if let Some(ref perf_metrics) = self.perf_metrics {
+            perf_metrics.record_data_ingestion(start_time.elapsed(), events_processed, errors_encountered);
+        }
 
         Ok(Some(event))
     }

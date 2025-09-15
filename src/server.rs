@@ -3,6 +3,8 @@ use crate::sim::{Simulator, SimulationMode};
 use crate::queue_fifo::FifoLevel;
 use crate::engine::OrderBook;
 use crate::error::{EngineResult, EngineError};
+use crate::metrics::{PerformanceMetrics, PerformanceMonitor, init_metrics_exporter};
+use crate::memory::MemoryTracker;
 use crate::logging::{
     init_logging, log_websocket_event, log_engine_error, log_startup, 
     log_health_metric, log_connection_status, log_simulation_step,
@@ -37,6 +39,10 @@ pub struct AppState {
     pub simulator: Arc<Mutex<Simulator<OrderBook<FifoLevel>>>>,
     /// System health metrics
     pub health_metrics: Arc<Mutex<SystemHealthMetrics>>,
+    /// Performance metrics for monitoring
+    pub perf_metrics: Arc<PerformanceMetrics>,
+    /// Memory usage tracker
+    pub memory_tracker: Arc<MemoryTracker>,
 }
 
 /// System health monitoring metrics
@@ -118,12 +124,17 @@ impl AppState {
         // Ensure simulator is in synthetic mode to avoid DataSource issues
         simulator.set_mode(SimulationMode::Synthetic);
         
-        log_startup("AppState", Some("Initialized with synthetic simulation mode"));
+        let perf_metrics = Arc::new(PerformanceMetrics::new());
+        let memory_tracker = Arc::new(MemoryTracker::new());
+        
+        log_startup("AppState", Some("Initialized with synthetic simulation mode and performance monitoring"));
         
         Self {
             snapshot_tx,
             simulator: Arc::new(Mutex::new(simulator)),
             health_metrics: Arc::new(Mutex::new(SystemHealthMetrics::new())),
+            perf_metrics,
+            memory_tracker,
         }
     }
 
@@ -646,6 +657,14 @@ pub async fn start_server(
         }
     }
     
+    // Initialize metrics exporter (Prometheus endpoint on port+1)
+    let metrics_port = port + 1;
+    if let Err(e) = init_metrics_exporter(metrics_port) {
+        warn!("Failed to initialize metrics exporter on port {}: {}", metrics_port, e);
+    } else {
+        log_startup("MetricsExporter", Some(&format!("Prometheus metrics available on port {}", metrics_port)));
+    }
+    
     log_startup("OrderBookServer", Some(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
     info!("Initializing Order Book WebSocket Server on port {}", port);
     
@@ -669,6 +688,11 @@ pub async fn start_server(
     // Create application state
     let state = AppState::new(simulator);
     log_startup("AppState", Some("Application state initialized"));
+    
+    // Start performance monitoring
+    let perf_monitor = PerformanceMonitor::new(state.perf_metrics.clone());
+    let _monitor_handle = perf_monitor.start_monitoring();
+    log_startup("PerformanceMonitor", Some("Background monitoring started"));
     
     // Create router
     let app = create_router(state.clone());
@@ -701,6 +725,7 @@ pub async fn start_server(
     info!("🚀 Order Book Server is ready!");
     info!("📡 WebSocket endpoint: ws://localhost:{}/ws", port);
     info!("🏥 Health check endpoint: http://localhost:{}/health", port);
+    info!("📊 Metrics endpoint: http://localhost:{}/metrics", metrics_port);
     info!("⚡ Simulation interval: {}ms", simulation_interval_ms);
     info!("📊 Logging level: {}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
     

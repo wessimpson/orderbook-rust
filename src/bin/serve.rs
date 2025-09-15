@@ -2,6 +2,7 @@ use orderbook::{start_server, Simulator, OrderBook, FifoLevel, Config, ConfigErr
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process;
+use std::env;
 
 /// Order Book Server CLI
 #[derive(Parser)]
@@ -45,7 +46,7 @@ struct Cli {
     verbose: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     /// Start the order book server
     Start,
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     
-    match cli.command.unwrap_or(Commands::Start) {
+    match cli.command.clone().unwrap_or(Commands::Start) {
         Commands::Start => {
             start_server_command(cli).await
         }

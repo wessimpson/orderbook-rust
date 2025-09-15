@@ -1,0 +1,105 @@
+# Prometheus alerting rules for Order Book system
+groups:
+  - name: orderbook_performance
+    rules:
+      # High latency alerts
+      - alert: HighOrderPlacementLatency
+        expr: histogram_quantile(0.95, rate(order_placement_duration_ns_bucket[5m])) > 10000000  # 10ms
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High order placement latency detected"
+          description: "95th percentile order placement latency is {{ $value }}ns (>10ms) for the last 5 minutes"
+
+      - alert: HighSnapshotGenerationLatency
+        expr: histogram_quantile(0.95, rate(snapshot_generation_duration_ns_bucket[5m])) > 100000000  # 100ms
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High snapshot generation latency detected"
+          description: "95th percentile snapshot generation latency is {{ $value }}ns (>100ms) for the last 5 minutes"
+
+      # Throughput alerts
+      - alert: LowOrderThroughput
+        expr: rate(orders_processed_total[5m]) < 1000  # Less than 1000 orders/sec
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low order processing throughput"
+          description: "Order processing rate is {{ $value }} orders/sec (target: >1000/sec) for the last 5 minutes"
+
+      # Error rate alerts
+      - alert: HighOrderFailureRate
+        expr: rate(orders_failed_total[5m]) / rate(orders_processed_total[5m]) > 0.05  # >5% failure rate
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High order failure rate detected"
+          description: "Order failure rate is {{ $value | humanizePercentage }} (>5%) for the last 5 minutes"
+
+      - alert: HighDataIngestionErrorRate
+        expr: rate(ingestion_errors_total[5m]) / rate(events_ingested_total[5m]) > 0.01  # >1% error rate
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High data ingestion error rate"
+          description: "Data ingestion error rate is {{ $value | humanizePercentage }} (>1%) for the last 5 minutes"
+
+  - name: orderbook_resources
+    rules:
+      # Memory usage alerts
+      - alert: HighMemoryUsage
+        expr: memory_usage_bytes > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value | humanizeBytes }} (>1GB) for the last 5 minutes"
+
+      # CPU usage alerts
+      - alert: HighCPUUsage
+        expr: cpu_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is {{ $value }}% (>80%) for the last 5 minutes"
+
+  - name: orderbook_business
+    rules:
+      # Market data quality
+      - alert: NoTradesGenerated
+        expr: increase(trades_generated_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No trades generated recently"
+          description: "No trades have been generated in the last 10 minutes"
+
+      # Data ingestion health
+      - alert: NoEventsIngested
+        expr: increase(events_ingested_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Data ingestion stopped"
+          description: "No events have been ingested in the last 5 minutes"
+
+      # System availability
+      - alert: OrderBookDown
+        expr: up{job="orderbook"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Order Book system is down"
+          description: "Order Book system has been down for more than 1 minute"
