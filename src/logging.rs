@@ -16,7 +16,7 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up the subscriber with JSON formatting for structured logging
-    tracing_subscriber::registry()
+    match tracing_subscriber::registry()
         .with(env_filter)
         .with(
             fmt::layer()
@@ -26,10 +26,22 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
                 .with_line_number(true)
                 .compact()
         )
-        .try_init()?;
-
-    info!("Logging system initialized");
-    Ok(())
+        .try_init() {
+        Ok(_) => {
+            info!("Logging system initialized");
+            Ok(())
+        }
+        Err(e) => {
+            // Check if the error is due to already being initialized
+            if e.to_string().contains("a global default trace dispatcher has already been set") {
+                // Logging is already initialized, this is fine
+                Ok(())
+            } else {
+                // Some other error occurred
+                Err(Box::new(e))
+            }
+        }
+    }
 }
 
 /// Initialize logging with custom configuration for testing
